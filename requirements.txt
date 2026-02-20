@@ -1,0 +1,4 @@
+selenium==4.*
+requests==2.*
+gspread==5.*
+google-auth==2.*
