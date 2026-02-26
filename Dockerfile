@@ -1,24 +1,15 @@
 FROM python:3.11-slim
 
-# 必要パッケージ
+# 必須パッケージ
 RUN apt-get update && apt-get install -y \
-    wget \
-    unzip \
     chromium \
     chromium-driver \
     fonts-liberation \
     libnss3 \
-    libgconf-2-4 \
-    libxi6 \
-    libgdk-pixbuf2.0-0 \
-    libgtk-3-0 \
     libxss1 \
     libasound2 \
     libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
+    libgtk-3-0 \
     xdg-utils \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
