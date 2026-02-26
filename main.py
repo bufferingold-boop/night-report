@@ -23,8 +23,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
 )
-safe_log = lambda msg: (logging.info(msg), print(msg))
 
+def safe_log(msg: str):
+    logging.info(msg)
+    print(msg, flush=True)
+
+# Selenium 通信タイムアウト無効化（あなたのまま）
 RemoteConnection.set_timeout = lambda *_: None
 
 # -----------------------------
@@ -37,7 +41,6 @@ TENANT_TEXT = os.getenv("TENANT_TEXT", "C").strip()
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
-
 
 def send_line_message(text: str) -> bool:
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
@@ -100,10 +103,19 @@ def start_browser(hour: int):
     options.add_argument("--disable-features=VizDisplayCompositor")
     options.add_argument("--window-size=1200,900")
 
-    # Debianのchromiumパス
+    # Debianのchromiumパス（あなたのまま）
     options.binary_location = "/usr/bin/chromium"
 
-    service = Service(log_path=f"chromedriver_{hour}.log")
+    # ★ここが修正点（超重要）:
+    # chromedriver の実体パスを明示して "Unable to obtain driver" を潰す
+    # ついでにログも残す（Selenium 4.10+ で log_output が使える）
+    log_path = f"/tmp/chromedriver_{hour}.log"
+    try:
+        service = Service(executable_path="/usr/bin/chromedriver", log_output=log_path)
+    except TypeError:
+        # 古い互換（log_output が無い環境向け）
+        service = Service(executable_path="/usr/bin/chromedriver")
+
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
