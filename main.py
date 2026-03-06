@@ -1,6 +1,5 @@
 import os
 import time
-import random
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -14,10 +13,10 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.remote.remote_connection import RemoteConnection
 from selenium.common.exceptions import TimeoutException
 
+# -----------------------------
+# 基本設定
+# -----------------------------
 JST = timezone(timedelta(hours=9))
-
-target_minute = 20
-tolerance_minutes = 3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +29,12 @@ def safe_log(msg: str):
 
 RemoteConnection.set_timeout = lambda *_: None
 
+# -----------------------------
+# 環境変数
+# -----------------------------
 LOGIN_URL = os.getenv("LOGIN_URL", "https://www.d-round.co.jp/adams/").strip()
+ATTENDANCE_URL = os.getenv("ATTENDANCE_URL", "https://www.d-round.co.jp/adams/attendance.php").strip()
+
 STAFF_ID = os.getenv("STAFF_ID", "").strip()
 PASSWORD = os.getenv("PASSWORD", "").strip()
 TENANT_TEXT = os.getenv("TENANT_TEXT", "C").strip()
@@ -41,9 +45,18 @@ LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium").strip()
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver").strip()
 
+# -----------------------------
+# 共通
+# -----------------------------
 def now_jst() -> datetime:
     return datetime.now(JST)
 
+def display_hour(dt: datetime) -> int:
+    return dt.hour + 24 if dt.hour < 7 else dt.hour
+
+# -----------------------------
+# LINE通知
+# -----------------------------
 def send_line_message(text: str) -> bool:
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
         safe_log("LINE通知スキップ：LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID 未設定")
@@ -70,9 +83,9 @@ def send_line_message(text: str) -> bool:
         safe_log(f"LINE通知例外：{e}")
         return False
 
-def display_hour(dt: datetime) -> int:
-    return dt.hour + 24 if dt.hour < 7 else dt.hour
-
+# -----------------------------
+# ブラウザ起動
+# -----------------------------
 def start_browser(hour: int):
     options = Options()
     options.add_argument("--headless=new")
@@ -93,23 +106,32 @@ def start_browser(hour: int):
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
+# -----------------------------
+# デバッグ用
+# -----------------------------
 def dump_debug_info(driver, prefix=""):
     if not driver:
         return
+
     try:
         safe_log(f"{prefix}現在URL: {driver.current_url}")
     except Exception:
         pass
+
     try:
         safe_log(f"{prefix}タイトル: {driver.title}")
     except Exception:
         pass
+
     try:
         src = driver.page_source[:1500].replace("\n", " ").replace("\r", " ")
         safe_log(f"{prefix}page_source(head): {src}")
     except Exception:
         pass
 
+# -----------------------------
+# ログイン + C選択 + 決定
+# -----------------------------
 def login_and_select_C(driver, timeout=60):
     if not STAFF_ID or not PASSWORD:
         raise RuntimeError("環境変数 STAFF_ID / PASSWORD が未設定です")
@@ -136,15 +158,19 @@ def login_and_select_C(driver, timeout=60):
     ).click()
     safe_log("決定ボタンをクリック")
 
-    # 元コードの流れを維持しつつ、Cloud Run向けに画面反映を待つ
+    # headless環境で select.php から進まない対策
+    time.sleep(2)
+    driver.get(ATTENDANCE_URL)
+    safe_log(f"出勤報告ページへ移動: {ATTENDANCE_URL}")
+
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.TAG_NAME, "body"))
     )
-    time.sleep(3)
+    dump_debug_info(driver, prefix="移動後 ")
 
-    safe_log("決定後の画面反映待機完了")
-    dump_debug_info(driver, prefix="決定後 ")
-
+# -----------------------------
+# 完了判定
+# -----------------------------
 def is_report_completed(driver, timeout=60):
     try:
         WebDriverWait(driver, timeout).until(
@@ -157,6 +183,9 @@ def is_report_completed(driver, timeout=60):
         links = driver.find_elements(By.XPATH, "//a[@href='/adams/logout.php' and text()='終了する']")
         return len(links) > 0
 
+# -----------------------------
+# 勤務状況報告
+# -----------------------------
 def perform_action(hour, mode, retry=3, timeout=120):
     disp = display_hour(now_jst())
 
@@ -224,6 +253,9 @@ def perform_action(hour, mode, retry=3, timeout=120):
 
     return False
 
+# -----------------------------
+# テスト実行
+# -----------------------------
 def run_night_work():
     safe_log("====== 勤務状況報告テスト開始 ======")
     send_line_message("【夜勤テスト】勤務状況報告テスト開始")
