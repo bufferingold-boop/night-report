@@ -11,7 +11,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.remote.remote_connection import RemoteConnection
-from selenium.common.exceptions import TimeoutException, NoSuchFrameException
+from selenium.common.exceptions import TimeoutException
 
 # -----------------------------
 # 基本設定
@@ -27,6 +27,7 @@ def safe_log(msg: str):
     logging.info(msg)
     print(msg, flush=True)
 
+# Selenium 通信タイムアウト対策
 RemoteConnection.set_timeout = lambda *_: None
 
 # -----------------------------
@@ -122,40 +123,10 @@ def dump_debug_info(driver, prefix=""):
         pass
 
     try:
-        src = driver.page_source[:1500].replace("\n", " ").replace("\r", " ")
+        src = driver.page_source[:2000].replace("\n", " ").replace("\r", " ")
         safe_log(f"{prefix}page_source(head): {src}")
     except Exception:
         pass
-
-# -----------------------------
-# frame切り替え
-# -----------------------------
-def switch_to_report_frame_if_needed(driver, timeout=10):
-    driver.switch_to.default_content()
-
-    # まず frame
-    try:
-        frame = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "frame"))
-        )
-        driver.switch_to.frame(frame)
-        safe_log("frameへ切り替え")
-        return
-    except Exception:
-        pass
-
-    # 次に iframe
-    try:
-        iframe = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "iframe"))
-        )
-        driver.switch_to.frame(iframe)
-        safe_log("iframeへ切り替え")
-        return
-    except Exception:
-        pass
-
-    safe_log("frame/iframeなし（通常ページのまま続行）")
 
 # -----------------------------
 # ログイン → C → 決定 → 勤務状況報告画面
@@ -167,48 +138,33 @@ def login_and_prepare_report(driver, timeout=180):
     driver.get(LOGIN_URL)
     safe_log("ログインページにアクセス")
 
+    # ログイン画面の入力欄待機
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.NAME, "staff_id"))
     )
 
     driver.find_element(By.NAME, "staff_id").send_keys(STAFF_ID)
     driver.find_element(By.NAME, "password").send_keys(PASSWORD)
-    driver.find_element(By.NAME, "send").click()
+
+    # ログイン送信
+    WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((By.NAME, "send"))
+    ).click()
     safe_log("ログイン送信完了")
 
-    # ログイン後の画面待機
-    WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((By.XPATH, f"//option[contains(text(),'{TENANT_TEXT}')]"))
-    )
-    safe_log("ログイン後の画面読み込み確認")
-
-    # C
+    # ログイン後、C が押せるまで待つ
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, f"//option[contains(text(),'{TENANT_TEXT}')]"))
     ).click()
     safe_log(f"プルダウンから {TENANT_TEXT} を選択")
 
-    # 決定
+    # 決定 が押せるまで待つ
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, "//input[@value='決定']"))
     ).click()
     safe_log("決定ボタンをクリック")
 
-    # 遷移待ち
-    WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )
-    safe_log("決定後の画面読み込み確認")
-
-    # frame対応
-    switch_to_report_frame_if_needed(driver, timeout=10)
-
-    # 勤務状況報告ボタン待機
-    WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((By.XPATH, "//input[contains(@value,'勤務状況報告')]"))
-    )
-    safe_log("勤務状況報告ボタンの出現を確認")
-
+    # 次画面の勤務状況報告が押せるまで待つ
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, "//input[contains(@value,'勤務状況報告')]"))
     )
@@ -221,12 +177,6 @@ def login_and_prepare_report(driver, timeout=180):
 # -----------------------------
 def is_report_completed(driver, timeout=60):
     try:
-        # frame内のまま失敗する場合があるので一旦戻す
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-
         WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located(
                 (By.XPATH, "//a[@href='/adams/logout.php' and text()='終了する']")
@@ -234,11 +184,8 @@ def is_report_completed(driver, timeout=60):
         )
         return True
     except Exception:
-        try:
-            links = driver.find_elements(By.XPATH, "//a[@href='/adams/logout.php' and text()='終了する']")
-            return len(links) > 0
-        except Exception:
-            return False
+        links = driver.find_elements(By.XPATH, "//a[@href='/adams/logout.php' and text()='終了する']")
+        return len(links) > 0
 
 # -----------------------------
 # 勤務状況報告テスト
