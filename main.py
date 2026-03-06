@@ -2,7 +2,7 @@ import os
 import time
 import random
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from selenium import webdriver
@@ -12,10 +12,13 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.remote.remote_connection import RemoteConnection
+from selenium.common.exceptions import TimeoutException
 
 # -----------------------------
 # 基本設定
 # -----------------------------
+JST = timezone(timedelta(hours=9))
+
 target_minute = 20
 tolerance_minutes = 3
 
@@ -28,7 +31,6 @@ def safe_log(msg: str):
     logging.info(msg)
     print(msg, flush=True)
 
-# Selenium 通信タイムアウト無効化（あなたのまま）
 RemoteConnection.set_timeout = lambda *_: None
 
 # -----------------------------
@@ -42,6 +44,20 @@ TENANT_TEXT = os.getenv("TENANT_TEXT", "C").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 
+CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium").strip()
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver").strip()
+
+
+# -----------------------------
+# 共通時刻関数
+# -----------------------------
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+# -----------------------------
+# LINE通知
+# -----------------------------
 def send_line_message(text: str) -> bool:
     if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_USER_ID:
         safe_log("LINE通知スキップ：LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID 未設定")
@@ -69,29 +85,41 @@ def send_line_message(text: str) -> bool:
         return False
 
 
+# -----------------------------
+# 表示用時間（0〜6 → 24〜30）
+# -----------------------------
 def display_hour(dt: datetime) -> int:
     return dt.hour + 24 if dt.hour < 7 else dt.hour
 
 
+# -----------------------------
+# 夜勤時間帯生成（23〜30）
+# -----------------------------
 def create_night_hours():
-    now = datetime.now()
+    now = now_jst()
     base_date = now.date() - timedelta(days=1) if now.hour < 7 else now.date()
+
     hours = []
     for h in range(23, 31):
         if h >= 24:
             dt = datetime.combine(
                 base_date + timedelta(days=1),
-                datetime.min.time()
+                datetime.min.time(),
+                tzinfo=JST
             ).replace(hour=h - 24, minute=target_minute)
         else:
             dt = datetime.combine(
                 base_date,
-                datetime.min.time()
+                datetime.min.time(),
+                tzinfo=JST
             ).replace(hour=h, minute=target_minute)
         hours.append((h, dt))
     return hours
 
 
+# -----------------------------
+# ブラウザ起動
+# -----------------------------
 def start_browser(hour: int):
     options = Options()
     options.add_argument("--headless=new")
@@ -103,23 +131,22 @@ def start_browser(hour: int):
     options.add_argument("--disable-features=VizDisplayCompositor")
     options.add_argument("--window-size=1200,900")
 
-    # Debianのchromiumパス（あなたのまま）
-    options.binary_location = "/usr/bin/chromium"
+    # Cloud Run Debian の chromium パス
+    options.binary_location = CHROME_BIN
 
-    # ★ここが修正点（超重要）:
-    # chromedriver の実体パスを明示して "Unable to obtain driver" を潰す
-    # ついでにログも残す（Selenium 4.10+ で log_output が使える）
-    log_path = f"/tmp/chromedriver_{hour}.log"
-    try:
-        service = Service(executable_path="/usr/bin/chromedriver", log_output=log_path)
-    except TypeError:
-        # 古い互換（log_output が無い環境向け）
-        service = Service(executable_path="/usr/bin/chromedriver")
+    # ★ 重要：driver を明示
+    service = Service(
+        executable_path=CHROMEDRIVER_PATH,
+        log_output=f"/tmp/chromedriver_{hour}.log",
+    )
 
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
 
+# -----------------------------
+# ログイン＋C選択
+# -----------------------------
 def login_and_select_C(driver, timeout=60):
     if not STAFF_ID or not PASSWORD:
         raise RuntimeError("環境変数 STAFF_ID / PASSWORD が未設定です")
@@ -147,6 +174,9 @@ def login_and_select_C(driver, timeout=60):
     safe_log("決定ボタンをクリック")
 
 
+# -----------------------------
+# 完了画面判定
+# -----------------------------
 def is_report_completed(driver, timeout=60):
     try:
         WebDriverWait(driver, timeout).until(
@@ -160,8 +190,32 @@ def is_report_completed(driver, timeout=60):
         return len(links) > 0
 
 
-def perform_action(hour, mode, retry=3, timeout=60):
-    disp = display_hour(datetime.now())
+# -----------------------------
+# デバッグログ
+# -----------------------------
+def dump_debug_info(driver, prefix=""):
+    try:
+        safe_log(f"{prefix}現在URL: {driver.current_url}")
+    except Exception:
+        pass
+
+    try:
+        safe_log(f"{prefix}タイトル: {driver.title}")
+    except Exception:
+        pass
+
+    try:
+        src = driver.page_source[:1000].replace("\n", " ").replace("\r", " ")
+        safe_log(f"{prefix}page_source(head): {src}")
+    except Exception:
+        pass
+
+
+# -----------------------------
+# 出勤 / 退勤 / 夜勤報告
+# -----------------------------
+def perform_action(hour, mode, retry=3, timeout=120):
+    disp = display_hour(now_jst())
 
     for attempt in range(1, retry + 1):
         driver = None
@@ -175,6 +229,8 @@ def perform_action(hour, mode, retry=3, timeout=60):
                 xpath_button = "//input[@value='退勤']"
             else:
                 xpath_button = "//input[contains(@value,'勤務状況報告')]"
+
+            dump_debug_info(driver, prefix=f"{disp}時：{mode}前 ")
 
             WebDriverWait(driver, timeout).until(
                 EC.element_to_be_clickable((By.XPATH, xpath_button))
@@ -199,10 +255,20 @@ def perform_action(hour, mode, retry=3, timeout=60):
 
             raise Exception("完了画面が確認できません")
 
-        except Exception as e:
-            safe_log(f"{disp}時：{mode}でエラー (試行{attempt}/{retry}): {e}")
+        except TimeoutException as e:
+            safe_log(f"{disp}時：{mode}でタイムアウト (試行{attempt}/{retry})")
+            dump_debug_info(driver, prefix=f"{disp}時：{mode}失敗時 ")
             if attempt == retry:
-                send_line_message(f"【夜勤】{disp}時：{mode} 失敗（最終）\n{e}")
+                send_line_message(f"【夜勤】{disp}時：{mode} 失敗（最終）\nTimeoutException")
+                return False
+            safe_log("5秒後に再試行...")
+            time.sleep(5)
+
+        except Exception as e:
+            safe_log(f"{disp}時：{mode}でエラー (試行{attempt}/{retry}): {type(e).__name__}: {e}")
+            dump_debug_info(driver, prefix=f"{disp}時：{mode}失敗時 ")
+            if attempt == retry:
+                send_line_message(f"【夜勤】{disp}時：{mode} 失敗（最終）\n{type(e).__name__}: {e}")
                 return False
             safe_log("5秒後に再試行...")
             time.sleep(5)
@@ -217,6 +283,9 @@ def perform_action(hour, mode, retry=3, timeout=60):
     return False
 
 
+# -----------------------------
+# メイン処理
+# -----------------------------
 def run_night_work():
     safe_log("====== 夜勤処理開始 ======")
     send_line_message("【夜勤】処理開始")
@@ -224,7 +293,7 @@ def run_night_work():
     perform_action(100, "出勤")
 
     night_hours = create_night_hours()
-    now = datetime.now()
+    now = now_jst()
 
     current_hour = None
     for h, t in night_hours:
@@ -254,7 +323,7 @@ def run_night_work():
             continue
 
         offset = random.randint(-tolerance_minutes, tolerance_minutes)
-        wait_sec = max((t - datetime.now()).total_seconds() + offset * 60, 0)
+        wait_sec = max((t - now_jst()).total_seconds() + offset * 60, 0)
         m, s = divmod(int(wait_sec), 60)
         safe_log(f"{h-1}時報告後、次まで待機 {m}分{s}秒")
         time.sleep(wait_sec)
@@ -265,8 +334,12 @@ def run_night_work():
             safe_log("30時報告完了。退勤待機へ移行")
             break
 
-    now = datetime.now()
-    target = datetime.combine(now.date(), datetime.min.time()).replace(hour=9, minute=5)
+    now = now_jst()
+    target = datetime.combine(
+        now.date(),
+        datetime.min.time(),
+        tzinfo=JST
+    ).replace(hour=9, minute=5)
 
     if now.hour >= 10:
         target += timedelta(days=1)
@@ -274,7 +347,7 @@ def run_night_work():
     offset = random.randint(-tolerance_minutes, tolerance_minutes)
     target += timedelta(minutes=offset)
 
-    wait_sec = max((target - datetime.now()).total_seconds(), 0)
+    wait_sec = max((target - now_jst()).total_seconds(), 0)
     m, s = divmod(int(wait_sec), 60)
     safe_log(f"退勤まで待機 {m}分{s}秒 (予定 {target})")
     time.sleep(wait_sec)
