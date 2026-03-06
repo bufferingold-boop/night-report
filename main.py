@@ -105,7 +105,7 @@ def dump_debug_info(driver, prefix=""):
     except Exception:
         pass
     try:
-        src = driver.page_source[:1000].replace("\n", " ").replace("\r", " ")
+        src = driver.page_source[:1500].replace("\n", " ").replace("\r", " ")
         safe_log(f"{prefix}page_source(head): {src}")
     except Exception:
         pass
@@ -131,22 +131,18 @@ def login_and_select_C(driver, timeout=60):
     ).click()
     safe_log(f"プルダウンから {TENANT_TEXT} を選択")
 
-    current_url_before = driver.current_url
-
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, "//input[@value='決定']"))
     ).click()
     safe_log("決定ボタンをクリック")
 
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.current_url != current_url_before or "select.php" in d.current_url
-    )
-
+    # 元コードの流れを維持しつつ、Cloud Run向けに画面反映を待つ
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.TAG_NAME, "body"))
     )
+    time.sleep(3)
 
-    safe_log("決定後の画面遷移を確認")
+    safe_log("決定後の画面反映待機完了")
     dump_debug_info(driver, prefix="決定後 ")
 
 def is_report_completed(driver, timeout=60):
@@ -170,20 +166,18 @@ def perform_action(hour, mode, retry=3, timeout=120):
             driver = start_browser(hour)
             login_and_select_C(driver, timeout=timeout)
 
-            if mode == "出勤":
-                xpath_button = "//input[@value='出勤']"
-            elif mode == "退勤":
-                xpath_button = "//input[@value='退勤']"
-            else:
+            if mode == "勤務状況報告":
                 xpath_button = "//input[contains(@value,'勤務状況報告')]"
+            elif mode == "出勤":
+                xpath_button = "//input[@value='出勤']"
+            else:
+                xpath_button = "//input[@value='退勤']"
 
             dump_debug_info(driver, prefix=f"{disp}時：{mode}前 ")
 
             WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located((By.XPATH, xpath_button))
-            )
-
-            driver.find_element(By.XPATH, xpath_button).click()
+                EC.element_to_be_clickable((By.XPATH, xpath_button))
+            ).click()
             safe_log(f"{disp}時：{mode}ボタンをクリック")
 
             WebDriverWait(driver, timeout).until(
