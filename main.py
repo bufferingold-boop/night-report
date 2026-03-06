@@ -27,6 +27,7 @@ def safe_log(msg: str):
     logging.info(msg)
     print(msg, flush=True)
 
+# Selenium通信タイムアウトを実質無効化
 RemoteConnection.set_timeout = lambda *_: None
 
 # -----------------------------
@@ -128,16 +129,16 @@ def dump_debug_info(driver, prefix=""):
         pass
 
 # -----------------------------
-# ログイン → C → 決定 → 勤務状況報告画面待機
+# ログイン → C → 決定 → 勤務状況報告画面
 # -----------------------------
-def login_and_prepare_report(driver, timeout=120):
+def login_and_prepare_report(driver, timeout=180):
     if not STAFF_ID or not PASSWORD:
         raise RuntimeError("環境変数 STAFF_ID / PASSWORD が未設定です")
 
     driver.get(LOGIN_URL)
     safe_log("ログインページにアクセス")
 
-    # staff_id 入力欄待機
+    # ログイン画面の入力欄待機
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.NAME, "staff_id"))
     )
@@ -147,19 +148,31 @@ def login_and_prepare_report(driver, timeout=120):
     driver.find_element(By.NAME, "send").click()
     safe_log("ログイン送信完了")
 
-    # C が押せるまで待つ
+    # ログイン後の次画面読み込み完了待機
+    WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((By.XPATH, f"//option[contains(text(),'{TENANT_TEXT}')]"))
+    )
+    safe_log("ログイン後の画面読み込み確認")
+
+    # C が押せるまで待つ → クリック
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, f"//option[contains(text(),'{TENANT_TEXT}')]"))
     ).click()
     safe_log(f"プルダウンから {TENANT_TEXT} を選択")
 
-    # 決定 が押せるまで待つ
+    # 決定 が押せるまで待つ → クリック
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, "//input[@value='決定']"))
     ).click()
     safe_log("決定ボタンをクリック")
 
-    # 次画面の 勤務状況報告 が押せるまで待つ
+    # 次画面の 勤務状況報告 が存在するまで待つ
+    WebDriverWait(driver, timeout).until(
+        EC.presence_of_element_located((By.XPATH, "//input[contains(@value,'勤務状況報告')]"))
+    )
+    safe_log("勤務状況報告ボタンの出現を確認")
+
+    # さらにクリック可能になるまで待つ
     WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, "//input[contains(@value,'勤務状況報告')]"))
     )
@@ -185,7 +198,7 @@ def is_report_completed(driver, timeout=60):
 # -----------------------------
 # 勤務状況報告テスト
 # -----------------------------
-def perform_report_test(hour, retry=3, timeout=120):
+def perform_report_test(hour, retry=3, timeout=180):
     disp = display_hour(now_jst())
 
     for attempt in range(1, retry + 1):
