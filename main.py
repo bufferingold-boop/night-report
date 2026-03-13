@@ -1,7 +1,15 @@
+# =============================
+# 夜勤報告スクリプト 単発実行版（環境変数対応）
+#  - checkin   : 出勤だけ実行
+#  - report XX : 指定時刻の勤務状況報告だけ実行（例: 23, 28, 30）
+#  - checkout  : 退勤だけ実行
+# =============================
+
 import os
+import sys
 import time
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import requests
 from selenium import webdriver
@@ -14,23 +22,6 @@ from selenium.webdriver.remote.remote_connection import RemoteConnection
 from selenium.common.exceptions import TimeoutException
 
 # -----------------------------
-# 基本設定
-# -----------------------------
-JST = timezone(timedelta(hours=9))
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s",
-)
-
-def safe_log(msg: str):
-    logging.info(msg)
-    print(msg, flush=True)
-
-# Selenium 通信タイムアウト対策
-RemoteConnection.set_timeout = lambda *_: None
-
-# -----------------------------
 # 環境変数
 # -----------------------------
 LOGIN_URL = os.getenv("LOGIN_URL", "https://www.d-round.co.jp/adams/").strip()
@@ -41,17 +32,25 @@ TENANT_TEXT = os.getenv("TENANT_TEXT", "C").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 
-CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium").strip()
-CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver").strip()
+CHROME_BIN = os.getenv("CHROME_BIN", "").strip()
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "").strip()
 
 # -----------------------------
-# 共通
+# 基本設定
 # -----------------------------
-def now_jst() -> datetime:
-    return datetime.now(JST)
+logging.basicConfig(
+    filename="night_report_single.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    encoding="utf-8"
+)
 
-def display_hour(dt: datetime) -> int:
-    return dt.hour + 24 if dt.hour < 7 else dt.hour
+# Selenium 通信タイムアウト無効化
+RemoteConnection.set_timeout = lambda *_: None
+
+def safe_log(msg):
+    logging.info(msg)
+    print(msg, flush=True)
 
 # -----------------------------
 # LINE通知
@@ -79,13 +78,13 @@ def send_line_message(text: str) -> bool:
         safe_log(f"LINE通知失敗：status={r.status_code} body={r.text}")
         return False
     except Exception as e:
-        safe_log(f"LINE通知例外：{e}")
+        safe_log(f"LINE通知例外：{type(e).__name__}: {e}")
         return False
 
 # -----------------------------
-# ブラウザ起動
+# 共通ブラウザ起動関数
 # -----------------------------
-def start_browser(hour: int):
+def start_browser(log_tag):
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
@@ -94,19 +93,26 @@ def start_browser(hour: int):
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--window-size=1200,900")
-    options.binary_location = CHROME_BIN
 
-    service = Service(
-        executable_path=CHROMEDRIVER_PATH,
-        log_output=f"/tmp/chromedriver_{hour}.log",
-    )
+    if CHROME_BIN:
+        options.binary_location = CHROME_BIN
+
+    if CHROMEDRIVER_PATH:
+        service = Service(
+            executable_path=CHROMEDRIVER_PATH,
+            log_output=f"chromedriver_{log_tag}.log",
+        )
+    else:
+        service = Service(
+            log_output=f"chromedriver_{log_tag}.log",
+        )
 
     driver = webdriver.Chrome(service=service, options=options)
+    driver.set_window_size(1200, 900)
     return driver
 
 # -----------------------------
-# デバッグ用
+# デバッグ
 # -----------------------------
 def dump_debug_info(driver, prefix=""):
     if not driver:
@@ -123,122 +129,236 @@ def dump_debug_info(driver, prefix=""):
         pass
 
     try:
-        src = driver.page_source[:2000].replace("\n", " ").replace("\r", " ")
+        src = driver.page_source[:2500].replace("\n", " ").replace("\r", " ")
         safe_log(f"{prefix}page_source(head): {src}")
     except Exception:
         pass
 
 # -----------------------------
-# ログイン → C → 決定 → 勤務状況報告画面
+# 共通待機＆クリック
 # -----------------------------
-def login_and_prepare_report(driver, timeout=180):
+def wait_and_click(driver, xpath, label, timeout=60):
+    elem = WebDriverWait(driver, timeout).until(
+        EC.element_to_be_clickable((By.XPATH, xpath))
+    )
+    elem.click()
+    safe_log(f"{label} をクリック")
+
+def wait_until_any(driver, xpaths, label, timeout=60):
+    end = time.time() + timeout
+    last_error = None
+
+    while time.time() < end:
+        for xp in xpaths:
+            try:
+                WebDriverWait(driver, 2).until(
+                    EC.element_to_be_clickable((By.XPATH, xp))
+                )
+                safe_log(f"{label} を確認")
+                return xp
+            except Exception as e:
+                last_error = e
+                continue
+        time.sleep(0.5)
+
+    raise TimeoutException(f"{label} が見つかりません last_error={last_error}")
+
+# -----------------------------
+# お知らせが出ていたら閉じる
+# -----------------------------
+def close_notice_if_present(driver, timeout=3):
+    notice_close_xpath = "//input[@name='send' and @type='submit' and @value='閉じる']"
+
+    try:
+        elem = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.XPATH, notice_close_xpath))
+        )
+        elem.click()
+        safe_log("会社からのお知らせを閉じる")
+        time.sleep(1)
+        return True
+    except Exception:
+        safe_log("会社からのお知らせなし")
+        return False
+
+# -----------------------------
+# ログイン＋テナント選択＋決定
+# -----------------------------
+def login_and_select_tenant(driver, timeout=60):
     if not STAFF_ID or not PASSWORD:
         raise RuntimeError("環境変数 STAFF_ID / PASSWORD が未設定です")
 
     driver.get(LOGIN_URL)
     safe_log("ログインページにアクセス")
 
-    # ログイン画面の入力欄待機
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.NAME, "staff_id"))
     )
 
-    driver.find_element(By.NAME, "staff_id").send_keys(STAFF_ID)
-    driver.find_element(By.NAME, "password").send_keys(PASSWORD)
+    staff = driver.find_element(By.NAME, "staff_id")
+    password = driver.find_element(By.NAME, "password")
 
-    # ログイン送信
-    WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((By.NAME, "send"))
-    ).click()
-    safe_log("ログイン送信完了")
+    staff.clear()
+    password.clear()
 
-    # ログイン後、C が押せるまで待つ
-    WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((By.XPATH, f"//option[contains(text(),'{TENANT_TEXT}')]"))
-    ).click()
-    safe_log(f"プルダウンから {TENANT_TEXT} を選択")
+    staff.send_keys(STAFF_ID)
+    password.send_keys(PASSWORD)
 
-    # 決定 が押せるまで待つ
-    WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((By.XPATH, "//input[@value='決定']"))
-    ).click()
-    safe_log("決定ボタンをクリック")
+    wait_and_click(driver, "//input[@name='send']", "ログイン送信ボタン", timeout=timeout)
 
-    # 次画面の勤務状況報告が押せるまで待つ
-    WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((By.XPATH, "//input[contains(@value,'勤務状況報告')]"))
+    close_notice_if_present(driver, timeout=3)
+
+    wait_until_any(
+        driver,
+        [f"//option[contains(text(),'{TENANT_TEXT}')]"],
+        "テナント選択画面",
+        timeout=timeout
     )
-    safe_log("勤務状況報告ボタンがクリック可能になったことを確認")
 
-    dump_debug_info(driver, prefix="決定後 ")
+    wait_and_click(driver, f"//option[contains(text(),'{TENANT_TEXT}')]", f"プルダウンから{TENANT_TEXT}", timeout=timeout)
+    wait_and_click(driver, "//input[@value='決定']", "決定ボタン", timeout=timeout)
+
+    wait_until_any(
+        driver,
+        [
+            "//input[@value='出勤']",
+            "//input[@value='退勤']",
+            "//input[contains(@value,'勤務状況報告')]",
+        ],
+        "決定後の主要ボタン",
+        timeout=timeout
+    )
 
 # -----------------------------
-# 完了画面判定
+# 成功/終了済み画面判定
 # -----------------------------
+def get_page_text(driver):
+    try:
+        return driver.page_source
+    except Exception:
+        return ""
+
+def get_current_url(driver):
+    try:
+        return driver.current_url
+    except Exception:
+        return ""
+
 def is_report_completed(driver, timeout=60):
     try:
-        WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//a[@href='/adams/logout.php' and text()='終了する']")
-            )
+        wait_until_any(
+            driver,
+            [
+                "//a[@href='/adams/logout.php' and text()='終了する']",
+                "//a[text()='終了する']",
+            ],
+            "終了する画面",
+            timeout=timeout
         )
         return True
     except Exception:
-        links = driver.find_elements(By.XPATH, "//a[@href='/adams/logout.php' and text()='終了する']")
-        return len(links) > 0
+        return False
+
+def is_effectively_completed(driver, mode):
+    url = get_current_url(driver)
+    page = get_page_text(driver)
+
+    if "/adams/logout.php" in page and "終了する" in page:
+        if "勤務状況報告が完了しました" in page:
+            return True
+        if "この時間の報告は終了しています" in page:
+            return True
+        if mode in ("出勤", "退勤"):
+            return True
+
+    if "report_thanks" in url:
+        return True
+
+    if "勤務状況報告が完了しました" in page:
+        return True
+
+    if "この時間の報告は終了しています" in page:
+        return True
+
+    return False
 
 # -----------------------------
-# 勤務状況報告テスト
+# 単発処理
 # -----------------------------
-def perform_report_test(hour, retry=3, timeout=180):
-    disp = display_hour(now_jst())
+def perform_action(mode, report_hour=None, retry=3, timeout=60):
+    if mode == "出勤":
+        log_tag = "checkin"
+        disp = "出勤"
+        xpath_button = "//input[@value='出勤']"
+
+    elif mode == "退勤":
+        log_tag = "checkout"
+        disp = "退勤"
+        xpath_button = "//input[@value='退勤']"
+
+    else:
+        if report_hour is None:
+            raise ValueError("勤務状況報告には report_hour が必要です")
+        log_tag = f"report_{report_hour}"
+        disp = f"{report_hour}時：勤務状況報告"
+        xpath_button = "//input[contains(@value,'勤務状況報告')]"
 
     for attempt in range(1, retry + 1):
         driver = None
         try:
-            driver = start_browser(hour)
-            login_and_prepare_report(driver, timeout=timeout)
+            driver = start_browser(log_tag)
+            login_and_select_tenant(driver, timeout=timeout)
 
-            # 勤務状況報告
-            WebDriverWait(driver, timeout).until(
-                EC.element_to_be_clickable((By.XPATH, "//input[contains(@value,'勤務状況報告')]"))
-            ).click()
-            safe_log(f"{disp}時：勤務状況報告ボタンをクリック")
+            wait_and_click(driver, xpath_button, f"{disp}ボタン", timeout=timeout)
 
-            # 内容確認
-            WebDriverWait(driver, timeout).until(
-                EC.element_to_be_clickable((By.XPATH, "//input[@value='内容確認']"))
-            ).click()
-            safe_log("内容確認ボタンをクリック")
+            wait_until_any(
+                driver,
+                ["//input[@value='内容確認']"],
+                "内容確認ボタン表示",
+                timeout=timeout
+            )
+            wait_and_click(driver, "//input[@value='内容確認']", "内容確認ボタン", timeout=timeout)
 
-            # 報告
-            WebDriverWait(driver, timeout).until(
-                EC.element_to_be_clickable((By.XPATH, "//input[@value='報告']"))
-            ).click()
-            safe_log(f"{disp}時：勤務状況報告ボタン押下")
+            wait_until_any(
+                driver,
+                ["//input[@value='報告']"],
+                "報告ボタン表示",
+                timeout=timeout
+            )
+            wait_and_click(driver, "//input[@value='報告']", f"{disp}報告ボタン", timeout=timeout)
 
-            if is_report_completed(driver, timeout):
-                safe_log(f"{disp}時：勤務状況報告完了（終了するリンク確認）")
-                send_line_message(f"【夜勤テスト】{disp}時：勤務状況報告 完了")
+            if is_report_completed(driver, timeout=timeout):
+                safe_log(f"{disp}完了（終了するリンク確認）")
+                if mode in ("出勤", "退勤"):
+                    send_line_message(f"【夜勤】{disp} 完了")
                 return True
 
-            raise RuntimeError("完了画面が確認できません")
+            if is_effectively_completed(driver, mode):
+                safe_log(f"{disp}完了（事後判定で成功/終了済み扱い）")
+                if mode in ("出勤", "退勤"):
+                    send_line_message(f"【夜勤】{disp} 完了")
+                return True
 
-        except TimeoutException:
-            safe_log(f"{disp}時：勤務状況報告でタイムアウト (試行{attempt}/{retry})")
-            dump_debug_info(driver, prefix=f"{disp}時：勤務状況報告失敗時 ")
-            if attempt == retry:
-                send_line_message(f"【夜勤テスト】{disp}時：勤務状況報告 失敗（最終）\nTimeoutException")
-                return False
-            safe_log("5秒後に再試行...")
-            time.sleep(5)
+            raise Exception("終了する画面が確認できません")
 
         except Exception as e:
-            safe_log(f"{disp}時：勤務状況報告でエラー (試行{attempt}/{retry}): {type(e).__name__}: {e}")
-            dump_debug_info(driver, prefix=f"{disp}時：勤務状況報告失敗時 ")
+            safe_log(f"{disp}でエラー (試行{attempt}/{retry}): {type(e).__name__}: {e}")
+            dump_debug_info(driver, prefix=f"{disp}失敗時 ")
+
+            try:
+                if driver and is_effectively_completed(driver, mode):
+                    safe_log(f"{disp}は事後判定で成功/終了済みのため再試行せず完了扱い")
+                    if mode in ("出勤", "退勤"):
+                        send_line_message(f"【夜勤】{disp} 完了")
+                    return True
+            except Exception:
+                pass
+
             if attempt == retry:
-                send_line_message(f"【夜勤テスト】{disp}時：勤務状況報告 失敗（最終）\n{type(e).__name__}: {e}")
+                if mode in ("出勤", "退勤"):
+                    send_line_message(f"【夜勤】{disp} 失敗")
                 return False
+
             safe_log("5秒後に再試行...")
             time.sleep(5)
 
@@ -252,17 +372,68 @@ def perform_report_test(hour, retry=3, timeout=180):
     return False
 
 # -----------------------------
-# テスト実行
+# ラッパー関数
 # -----------------------------
-def run_night_work():
-    safe_log("====== 勤務状況報告テスト開始 ======")
-    send_line_message("【夜勤テスト】勤務状況報告テスト開始")
+def run_checkin():
+    return perform_action("出勤")
 
-    current_hour = display_hour(now_jst())
-    perform_report_test(current_hour)
+def run_report(hour):
+    return perform_action("勤務状況報告", report_hour=hour)
 
-    safe_log("====== 勤務状況報告テスト終了 ======")
-    send_line_message("【夜勤テスト】勤務状況報告テスト終了")
+def run_checkout():
+    return perform_action("退勤")
+
+# -----------------------------
+# CLI
+# -----------------------------
+def print_usage():
+    print("使い方:")
+    print("  python night_report_single.py checkin")
+    print("  python night_report_single.py report 28")
+    print("  python night_report_single.py checkout")
+
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(1)
+
+    command = sys.argv[1].strip().lower()
+
+    if command == "checkin":
+        safe_log("====== 出勤単発実行開始 ======")
+        ok = run_checkin()
+        safe_log("====== 出勤単発実行終了 ======")
+        sys.exit(0 if ok else 2)
+
+    elif command == "report":
+        if len(sys.argv) < 3:
+            print("report には時刻指定が必要です。例: python night_report_single.py report 28")
+            sys.exit(1)
+
+        try:
+            hour = int(sys.argv[2])
+        except ValueError:
+            print("時刻は整数で指定してください。例: 23, 28, 30")
+            sys.exit(1)
+
+        if hour < 23 or hour > 30:
+            print("勤務状況報告の時刻は 23〜30 で指定してください。")
+            sys.exit(1)
+
+        safe_log(f"====== {hour}時 勤務状況報告単発実行開始 ======")
+        ok = run_report(hour)
+        safe_log(f"====== {hour}時 勤務状況報告単発実行終了 ======")
+        sys.exit(0 if ok else 2)
+
+    elif command == "checkout":
+        safe_log("====== 退勤単発実行開始 ======")
+        ok = run_checkout()
+        safe_log("====== 退勤単発実行終了 ======")
+        sys.exit(0 if ok else 2)
+
+    else:
+        print_usage()
+        sys.exit(1)
 
 if __name__ == "__main__":
-    run_night_work()
+    main()
