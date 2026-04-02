@@ -1,8 +1,11 @@
 # =============================
-# 夜勤報告スクリプト 単発実行版（環境変数対応）
+# 夜勤報告スクリプト 単発実行版（環境変数対応・Cloud Run Job向け）
 #  - checkin   : 出勤だけ実行
 #  - report XX : 指定時刻の勤務状況報告だけ実行（例: 23, 28, 30）
 #  - checkout  : 退勤だけ実行
+#  - ログイン後、不定期の「会社からのお知らせ」が出たら閉じる
+#  - 例外時も「実は成功済み / 終了済み」なら完了扱いにする
+#  - テナント選択画面が見つからない時はURL/タイトル/page_sourceを必ず出す
 # =============================
 
 import os
@@ -32,23 +35,20 @@ TENANT_TEXT = os.getenv("TENANT_TEXT", "C").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 
-CHROME_BIN = os.getenv("CHROME_BIN", "").strip()
-CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "").strip()
+CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium").strip()
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver").strip()
 
 # -----------------------------
 # 基本設定
 # -----------------------------
 logging.basicConfig(
-    filename="night_report_single.log",
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
-    encoding="utf-8"
 )
 
-# Selenium 通信タイムアウト無効化
 RemoteConnection.set_timeout = lambda *_: None
 
-def safe_log(msg):
+def safe_log(msg: str):
     logging.info(msg)
     print(msg, flush=True)
 
@@ -82,6 +82,12 @@ def send_line_message(text: str) -> bool:
         return False
 
 # -----------------------------
+# 表示用時間（0〜6 → 24〜30）
+# -----------------------------
+def display_hour(dt):
+    return dt.hour + 24 if dt.hour < 7 else dt.hour
+
+# -----------------------------
 # 共通ブラウザ起動関数
 # -----------------------------
 def start_browser(log_tag):
@@ -93,22 +99,17 @@ def start_browser(log_tag):
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--window-size=1400,1100")
 
     if CHROME_BIN:
         options.binary_location = CHROME_BIN
 
-    if CHROMEDRIVER_PATH:
-        service = Service(
-            executable_path=CHROMEDRIVER_PATH,
-            log_output=f"chromedriver_{log_tag}.log",
-        )
-    else:
-        service = Service(
-            log_output=f"chromedriver_{log_tag}.log",
-        )
+    service = Service(
+        executable_path=CHROMEDRIVER_PATH,
+        log_output=f"/tmp/chromedriver_{log_tag}.log",
+    )
 
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_window_size(1200, 900)
     return driver
 
 # -----------------------------
@@ -208,26 +209,42 @@ def login_and_select_tenant(driver, timeout=60):
 
     close_notice_if_present(driver, timeout=3)
 
-    wait_until_any(
+    try:
+        wait_until_any(
+            driver,
+            [f"//option[contains(text(),'{TENANT_TEXT}')]"],
+            "テナント選択画面",
+            timeout=timeout
+        )
+    except Exception as e:
+        safe_log(f"テナント選択画面待ちで失敗: {type(e).__name__}: {e}")
+        dump_debug_info(driver, prefix="テナント選択失敗時 ")
+        raise
+
+    wait_and_click(
         driver,
-        [f"//option[contains(text(),'{TENANT_TEXT}')]"],
-        "テナント選択画面",
+        f"//option[contains(text(),'{TENANT_TEXT}')]",
+        f"プルダウンから{TENANT_TEXT}",
         timeout=timeout
     )
 
-    wait_and_click(driver, f"//option[contains(text(),'{TENANT_TEXT}')]", f"プルダウンから{TENANT_TEXT}", timeout=timeout)
     wait_and_click(driver, "//input[@value='決定']", "決定ボタン", timeout=timeout)
 
-    wait_until_any(
-        driver,
-        [
-            "//input[@value='出勤']",
-            "//input[@value='退勤']",
-            "//input[contains(@value,'勤務状況報告')]",
-        ],
-        "決定後の主要ボタン",
-        timeout=timeout
-    )
+    try:
+        wait_until_any(
+            driver,
+            [
+                "//input[@value='出勤']",
+                "//input[@value='退勤']",
+                "//input[contains(@value,'勤務状況報告')]",
+            ],
+            "決定後の主要ボタン",
+            timeout=timeout
+        )
+    except Exception as e:
+        safe_log(f"決定後の主要ボタン待ちで失敗: {type(e).__name__}: {e}")
+        dump_debug_info(driver, prefix="決定後失敗時 ")
+        raise
 
 # -----------------------------
 # 成功/終了済み画面判定
@@ -388,9 +405,9 @@ def run_checkout():
 # -----------------------------
 def print_usage():
     print("使い方:")
-    print("  python night_report_single.py checkin")
-    print("  python night_report_single.py report 28")
-    print("  python night_report_single.py checkout")
+    print("  python main.py checkin")
+    print("  python main.py report 28")
+    print("  python main.py checkout")
 
 def main():
     if len(sys.argv) < 2:
@@ -407,7 +424,7 @@ def main():
 
     elif command == "report":
         if len(sys.argv) < 3:
-            print("report には時刻指定が必要です。例: python night_report_single.py report 28")
+            print("report には時刻指定が必要です。例: python main.py report 28")
             sys.exit(1)
 
         try:
