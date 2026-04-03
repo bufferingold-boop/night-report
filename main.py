@@ -209,7 +209,7 @@ def login_and_select_tenant(driver, timeout=60):
 
     close_notice_if_present(driver, timeout=3)
 
-    try:
+        try:
         wait_until_any(
             driver,
             [f"//option[contains(text(),'{TENANT_TEXT}')]"],
@@ -218,7 +218,23 @@ def login_and_select_tenant(driver, timeout=60):
         )
     except Exception as e:
         safe_log(f"テナント選択画面待ちで失敗: {type(e).__name__}: {e}")
-        dump_debug_info(driver, prefix="テナント選択失敗時 ")
+
+        try:
+            safe_log(f"テナント選択失敗時 現在URL: {driver.current_url}")
+        except Exception as e2:
+            safe_log(f"テナント選択失敗時 現在URL取得失敗: {type(e2).__name__}: {e2}")
+
+        try:
+            safe_log(f"テナント選択失敗時 タイトル: {driver.title}")
+        except Exception as e2:
+            safe_log(f"テナント選択失敗時 タイトル取得失敗: {type(e2).__name__}: {e2}")
+
+        try:
+            src = driver.page_source[:2500].replace("\n", " ").replace("\r", " ")
+            safe_log(f"テナント選択失敗時 page_source(head): {src}")
+        except Exception as e2:
+            safe_log(f"テナント選択失敗時 page_source取得失敗: {type(e2).__name__}: {e2}")
+
         raise
 
     wait_and_click(
