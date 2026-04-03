@@ -5,21 +5,20 @@
 #  - checkout  : 退勤だけ実行
 #  - ログイン後、不定期の「会社からのお知らせ」が出たら閉じる
 #  - 例外時も「実は成功済み / 終了済み」なら完了扱いにする
-#  - テナント選択画面が見つからない時はURL/タイトル/page_sourceを必ず出す
+#  - Cloud Run では option直クリックではなく Select でテナント選択
 # =============================
 
 import os
 import sys
 import time
 import logging
-from datetime import datetime
 
 import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.remote.remote_connection import RemoteConnection
 from selenium.common.exceptions import TimeoutException
@@ -82,12 +81,6 @@ def send_line_message(text: str) -> bool:
         return False
 
 # -----------------------------
-# 表示用時間（0〜6 → 24〜30）
-# -----------------------------
-def display_hour(dt):
-    return dt.hour + 24 if dt.hour < 7 else dt.hour
-
-# -----------------------------
 # 共通ブラウザ起動関数
 # -----------------------------
 def start_browser(log_tag):
@@ -121,19 +114,19 @@ def dump_debug_info(driver, prefix=""):
 
     try:
         safe_log(f"{prefix}現在URL: {driver.current_url}")
-    except Exception:
-        pass
+    except Exception as e:
+        safe_log(f"{prefix}現在URL取得失敗: {type(e).__name__}: {e}")
 
     try:
         safe_log(f"{prefix}タイトル: {driver.title}")
-    except Exception:
-        pass
+    except Exception as e:
+        safe_log(f"{prefix}タイトル取得失敗: {type(e).__name__}: {e}")
 
     try:
         src = driver.page_source[:2500].replace("\n", " ").replace("\r", " ")
         safe_log(f"{prefix}page_source(head): {src}")
-    except Exception:
-        pass
+    except Exception as e:
+        safe_log(f"{prefix}page_source取得失敗: {type(e).__name__}: {e}")
 
 # -----------------------------
 # 共通待機＆クリック
@@ -183,6 +176,40 @@ def close_notice_if_present(driver, timeout=3):
         return False
 
 # -----------------------------
+# テナント選択
+# -----------------------------
+def select_tenant(driver, timeout=60):
+    try:
+        select_elem = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.NAME, "order_id"))
+        )
+        safe_log("テナント選択プルダウンを確認")
+    except Exception as e:
+        safe_log(f"テナント選択プルダウン待ちで失敗: {type(e).__name__}: {e}")
+        dump_debug_info(driver, prefix="テナント選択失敗時 ")
+        raise
+
+    try:
+        select_box = Select(select_elem)
+        matched = False
+
+        for i, opt in enumerate(select_box.options):
+            text = opt.text.strip()
+            safe_log(f"テナント候補[{i}]: {text}")
+            if TENANT_TEXT in text:
+                select_box.select_by_visible_text(opt.text)
+                safe_log(f"プルダウンから{TENANT_TEXT} を選択")
+                matched = True
+                break
+
+        if not matched:
+            raise RuntimeError(f"TENANT_TEXT='{TENANT_TEXT}' を含む選択肢が見つかりません")
+    except Exception as e:
+        safe_log(f"テナント選択で失敗: {type(e).__name__}: {e}")
+        dump_debug_info(driver, prefix="テナント選択失敗時 ")
+        raise
+
+# -----------------------------
 # ログイン＋テナント選択＋決定
 # -----------------------------
 def login_and_select_tenant(driver, timeout=60):
@@ -209,40 +236,7 @@ def login_and_select_tenant(driver, timeout=60):
 
     close_notice_if_present(driver, timeout=3)
 
-        try:
-        wait_until_any(
-            driver,
-            [f"//option[contains(text(),'{TENANT_TEXT}')]"],
-            "テナント選択画面",
-            timeout=timeout
-        )
-    except Exception as e:
-        safe_log(f"テナント選択画面待ちで失敗: {type(e).__name__}: {e}")
-
-        try:
-            safe_log(f"テナント選択失敗時 現在URL: {driver.current_url}")
-        except Exception as e2:
-            safe_log(f"テナント選択失敗時 現在URL取得失敗: {type(e2).__name__}: {e2}")
-
-        try:
-            safe_log(f"テナント選択失敗時 タイトル: {driver.title}")
-        except Exception as e2:
-            safe_log(f"テナント選択失敗時 タイトル取得失敗: {type(e2).__name__}: {e2}")
-
-        try:
-            src = driver.page_source[:2500].replace("\n", " ").replace("\r", " ")
-            safe_log(f"テナント選択失敗時 page_source(head): {src}")
-        except Exception as e2:
-            safe_log(f"テナント選択失敗時 page_source取得失敗: {type(e2).__name__}: {e2}")
-
-        raise
-
-    wait_and_click(
-        driver,
-        f"//option[contains(text(),'{TENANT_TEXT}')]",
-        f"プルダウンから{TENANT_TEXT}",
-        timeout=timeout
-    )
+    select_tenant(driver, timeout=timeout)
 
     wait_and_click(driver, "//input[@value='決定']", "決定ボタン", timeout=timeout)
 
@@ -323,12 +317,10 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
         log_tag = "checkin"
         disp = "出勤"
         xpath_button = "//input[@value='出勤']"
-
     elif mode == "退勤":
         log_tag = "checkout"
         disp = "退勤"
         xpath_button = "//input[@value='退勤']"
-
     else:
         if report_hour is None:
             raise ValueError("勤務状況報告には report_hour が必要です")
