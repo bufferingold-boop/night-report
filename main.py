@@ -1,8 +1,8 @@
 # =============================
 # 夜勤報告スクリプト 単発実行版（環境変数対応・Cloud Run Job向け）
-#  - checkin   : 出勤だけ実行
-#  - report XX : 指定時刻の勤務状況報告だけ実行（例: 23, 28, 30）
-#  - checkout  : 退勤だけ実行
+#  - checkin   : 出勤だけ実行（即時）
+#  - report XX : 指定時刻の勤務状況報告だけ実行（0〜6分ランダム待機）
+#  - checkout  : 退勤だけ実行（0〜6分ランダム待機）
 #  - ログイン後、不定期の「会社からのお知らせ」が出たら閉じる
 #  - 例外時も「実は成功済み / 終了済み」なら完了扱いにする
 #  - Cloud Run では option直クリックではなく Select でテナント選択
@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import logging
+import random
 
 import requests
 from selenium import webdriver
@@ -37,6 +38,10 @@ LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium").strip()
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver").strip()
 
+# ランダム待機用
+ENABLE_RANDOM_DELAY = os.getenv("ENABLE_RANDOM_DELAY", "1").strip() == "1"
+RANDOM_DELAY_MAX_MINUTES = int(os.getenv("RANDOM_DELAY_MAX_MINUTES", "6").strip())
+
 # -----------------------------
 # 基本設定
 # -----------------------------
@@ -50,6 +55,23 @@ RemoteConnection.set_timeout = lambda *_: None
 def safe_log(msg: str):
     logging.info(msg)
     print(msg, flush=True)
+
+# -----------------------------
+# ランダム待機
+# -----------------------------
+def random_delay_if_enabled(label: str):
+    if not ENABLE_RANDOM_DELAY:
+        safe_log(f"{label}：ランダム待機なし")
+        return
+
+    if RANDOM_DELAY_MAX_MINUTES <= 0:
+        safe_log(f"{label}：RANDOM_DELAY_MAX_MINUTES <= 0 のため待機なし")
+        return
+
+    wait_sec = random.randint(0, RANDOM_DELAY_MAX_MINUTES * 60)
+    m, s = divmod(wait_sec, 60)
+    safe_log(f"{label}：ランダム待機 {m}分{s}秒")
+    time.sleep(wait_sec)
 
 # -----------------------------
 # LINE通知
@@ -317,16 +339,21 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
         log_tag = "checkin"
         disp = "出勤"
         xpath_button = "//input[@value='出勤']"
+        safe_log("出勤前：ランダム待機なし")
+
     elif mode == "退勤":
         log_tag = "checkout"
         disp = "退勤"
         xpath_button = "//input[@value='退勤']"
+        random_delay_if_enabled("退勤前")
+
     else:
         if report_hour is None:
             raise ValueError("勤務状況報告には report_hour が必要です")
         log_tag = f"report_{report_hour}"
         disp = f"{report_hour}時：勤務状況報告"
         xpath_button = "//input[contains(@value,'勤務状況報告')]"
+        random_delay_if_enabled(f"{report_hour}時報告前")
 
     for attempt in range(1, retry + 1):
         driver = None
