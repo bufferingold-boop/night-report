@@ -6,6 +6,8 @@
 #  - ログイン後、不定期の「会社からのお知らせ」が出たら閉じる
 #  - 例外時も「実は成功済み / 終了済み」なら完了扱いにする
 #  - Cloud Run では option直クリックではなく Select でテナント選択
+#  - checkin成功後 : report系 + checkout の Cloud Scheduler を resume
+#  - checkout成功後: report系 + checkout の Cloud Scheduler を pause
 # =============================
 
 import os
@@ -13,6 +15,10 @@ import sys
 import time
 import logging
 import random
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
 
 import requests
 from selenium import webdriver
@@ -34,6 +40,9 @@ TENANT_TEXT = os.getenv("TENANT_TEXT", "C").strip()
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
+
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "night-report").strip()
+GCP_REGION = os.getenv("GCP_REGION", "asia-northeast1").strip()
 
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium").strip()
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver").strip()
@@ -101,6 +110,113 @@ def send_line_message(text: str) -> bool:
     except Exception as e:
         safe_log(f"LINE通知例外：{type(e).__name__}: {e}")
         return False
+
+# -----------------------------
+# Cloud Scheduler 自動ON/OFF
+# -----------------------------
+AUTO_SCHEDULER_NAMES = [
+    "night-report-23-scheduler-trigger",
+    "night-report-24-scheduler-trigger",
+    "night-report-25-scheduler-trigger",
+    "night-report-26-scheduler-trigger",
+    "night-report-27-scheduler-trigger",
+    "night-report-28-scheduler-trigger",
+    "night-report-29-scheduler-trigger",
+    "night-report-30-scheduler-trigger",
+    "night-checkout-scheduler-trigger",
+]
+
+def get_access_token():
+    """
+    Cloud Run / Cloud Run Job 上のメタデータサーバーから
+    実行中サービスアカウントのアクセストークンを取得
+    """
+    url = (
+        "http://metadata.google.internal/computeMetadata/v1/"
+        "instance/service-accounts/default/token"
+    )
+    req = urllib.request.Request(url)
+    req.add_header("Metadata-Flavor", "Google")
+
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data["access_token"]
+
+def build_scheduler_resource(job_name: str) -> str:
+    return f"projects/{GCP_PROJECT_ID}/locations/{GCP_REGION}/jobs/{job_name}"
+
+def call_scheduler_api(job_name: str, action: str) -> bool:
+    """
+    action: 'resume' or 'pause'
+    """
+    if action not in ("resume", "pause"):
+        raise ValueError(f"invalid action: {action}")
+
+    token = get_access_token()
+    resource = build_scheduler_resource(job_name)
+    url = f"https://cloudscheduler.googleapis.com/v1/{resource}:{action}"
+
+    req = urllib.request.Request(url, data=b"{}", method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            safe_log(
+                f"[scheduler] {action.upper()} success: "
+                f"{job_name} status={resp.status} body={body}"
+            )
+            return True
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        safe_log(
+            f"[scheduler] {action.upper()} failed: "
+            f"{job_name} status={e.code} body={err_body}"
+        )
+        return False
+    except Exception as e:
+        safe_log(
+            f"[scheduler] {action.upper()} exception: "
+            f"{job_name}: {type(e).__name__}: {e}"
+        )
+        return False
+
+def resume_auto_schedulers():
+    safe_log("[scheduler] 自動実行用 Scheduler を RESUME 開始")
+    results = {}
+    for name in AUTO_SCHEDULER_NAMES:
+        results[name] = call_scheduler_api(name, "resume")
+    ok_count = sum(1 for v in results.values() if v)
+    ng_count = len(results) - ok_count
+    safe_log(f"[scheduler] RESUME 完了 success={ok_count} fail={ng_count}")
+    return results
+
+def pause_auto_schedulers():
+    safe_log("[scheduler] 自動実行用 Scheduler を PAUSE 開始")
+    results = {}
+    for name in AUTO_SCHEDULER_NAMES:
+        results[name] = call_scheduler_api(name, "pause")
+    ok_count = sum(1 for v in results.values() if v)
+    ng_count = len(results) - ok_count
+    safe_log(f"[scheduler] PAUSE 完了 success={ok_count} fail={ng_count}")
+    return results
+
+def format_scheduler_result(results: dict) -> str:
+    ok = [k for k, v in results.items() if v]
+    ng = [k for k, v in results.items() if not v]
+
+    lines = [f"成功: {len(ok)} / 失敗: {len(ng)}"]
+
+    if ok:
+        lines.append("成功一覧:")
+        lines.extend([f"- {x}" for x in ok])
+
+    if ng:
+        lines.append("失敗一覧:")
+        lines.extend([f"- {x}" for x in ng])
+
+    return "\n".join(lines)
 
 # -----------------------------
 # 共通ブラウザ起動関数
@@ -225,7 +341,9 @@ def select_tenant(driver, timeout=60):
                 break
 
         if not matched:
-            raise RuntimeError(f"TENANT_TEXT='{TENANT_TEXT}' を含む選択肢が見つかりません")
+            raise RuntimeError(
+                f"TENANT_TEXT='{TENANT_TEXT}' を含む選択肢が見つかりません"
+            )
     except Exception as e:
         safe_log(f"テナント選択で失敗: {type(e).__name__}: {e}")
         dump_debug_info(driver, prefix="テナント選択失敗時 ")
@@ -271,7 +389,7 @@ def login_and_select_tenant(driver, timeout=60):
                 "//input[contains(@value,'勤務状況報告')]",
             ],
             "決定後の主要ボタン",
-            timeout=timeout
+            timeout=timeout,
         )
     except Exception as e:
         safe_log(f"決定後の主要ボタン待ちで失敗: {type(e).__name__}: {e}")
@@ -302,7 +420,7 @@ def is_report_completed(driver, timeout=60):
                 "//a[text()='終了する']",
             ],
             "終了する画面",
-            timeout=timeout
+            timeout=timeout,
         )
         return True
     except Exception:
@@ -367,7 +485,7 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
                 driver,
                 ["//input[@value='内容確認']"],
                 "内容確認ボタン表示",
-                timeout=timeout
+                timeout=timeout,
             )
             wait_and_click(driver, "//input[@value='内容確認']", "内容確認ボタン", timeout=timeout)
 
@@ -375,20 +493,54 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
                 driver,
                 ["//input[@value='報告']"],
                 "報告ボタン表示",
-                timeout=timeout
+                timeout=timeout,
             )
             wait_and_click(driver, "//input[@value='報告']", f"{disp}報告ボタン", timeout=timeout)
 
             if is_report_completed(driver, timeout=timeout):
                 safe_log(f"{disp}完了（終了するリンク確認）")
-                if mode in ("出勤", "退勤"):
-                    send_line_message(f"【夜勤】{disp} 完了")
+
+                if mode == "出勤":
+                    scheduler_results = resume_auto_schedulers()
+                    scheduler_summary = format_scheduler_result(scheduler_results)
+                    send_line_message(
+                        f"【夜勤】{disp} 完了\n"
+                        f"本日の自動報告・退勤Schedulerを有効化しました\n\n"
+                        f"{scheduler_summary}"
+                    )
+
+                elif mode == "退勤":
+                    scheduler_results = pause_auto_schedulers()
+                    scheduler_summary = format_scheduler_result(scheduler_results)
+                    send_line_message(
+                        f"【夜勤】{disp} 完了\n"
+                        f"本日の自動報告・退勤Schedulerを停止しました\n\n"
+                        f"{scheduler_summary}"
+                    )
+
                 return True
 
             if is_effectively_completed(driver, mode):
                 safe_log(f"{disp}完了（事後判定で成功/終了済み扱い）")
-                if mode in ("出勤", "退勤"):
-                    send_line_message(f"【夜勤】{disp} 完了")
+
+                if mode == "出勤":
+                    scheduler_results = resume_auto_schedulers()
+                    scheduler_summary = format_scheduler_result(scheduler_results)
+                    send_line_message(
+                        f"【夜勤】{disp} 完了\n"
+                        f"本日の自動報告・退勤Schedulerを有効化しました\n\n"
+                        f"{scheduler_summary}"
+                    )
+
+                elif mode == "退勤":
+                    scheduler_results = pause_auto_schedulers()
+                    scheduler_summary = format_scheduler_result(scheduler_results)
+                    send_line_message(
+                        f"【夜勤】{disp} 完了\n"
+                        f"本日の自動報告・退勤Schedulerを停止しました\n\n"
+                        f"{scheduler_summary}"
+                    )
+
                 return True
 
             raise Exception("終了する画面が確認できません")
@@ -400,8 +552,25 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
             try:
                 if driver and is_effectively_completed(driver, mode):
                     safe_log(f"{disp}は事後判定で成功/終了済みのため再試行せず完了扱い")
-                    if mode in ("出勤", "退勤"):
-                        send_line_message(f"【夜勤】{disp} 完了")
+
+                    if mode == "出勤":
+                        scheduler_results = resume_auto_schedulers()
+                        scheduler_summary = format_scheduler_result(scheduler_results)
+                        send_line_message(
+                            f"【夜勤】{disp} 完了\n"
+                            f"本日の自動報告・退勤Schedulerを有効化しました\n\n"
+                            f"{scheduler_summary}"
+                        )
+
+                    elif mode == "退勤":
+                        scheduler_results = pause_auto_schedulers()
+                        scheduler_summary = format_scheduler_result(scheduler_results)
+                        send_line_message(
+                            f"【夜勤】{disp} 完了\n"
+                            f"本日の自動報告・退勤Schedulerを停止しました\n\n"
+                            f"{scheduler_summary}"
+                        )
+
                     return True
             except Exception:
                 pass
