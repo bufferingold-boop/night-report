@@ -8,6 +8,8 @@
 #  - Cloud Run では option直クリックではなく Select でテナント選択
 #  - checkin成功後 : report系 + checkout の Cloud Scheduler を resume
 #  - checkout成功後: report系 + checkout の Cloud Scheduler を pause
+#  - 再試行間隔を 15秒 → 30秒 → 60秒 に強化
+#  - Warning / Fatal error / Notice ページ検知を追加
 # =============================
 
 import os
@@ -51,6 +53,9 @@ CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver").stri
 ENABLE_RANDOM_DELAY = os.getenv("ENABLE_RANDOM_DELAY", "1").strip() == "1"
 RANDOM_DELAY_MAX_MINUTES = int(os.getenv("RANDOM_DELAY_MAX_MINUTES", "6").strip())
 
+# 再試行待機秒
+RETRY_WAIT_SECONDS = [15, 30, 60]
+
 # -----------------------------
 # 基本設定
 # -----------------------------
@@ -61,9 +66,11 @@ logging.basicConfig(
 
 RemoteConnection.set_timeout = lambda *_: None
 
+
 def safe_log(msg: str):
     logging.info(msg)
     print(msg, flush=True)
+
 
 # -----------------------------
 # ランダム待機
@@ -81,6 +88,7 @@ def random_delay_if_enabled(label: str):
     m, s = divmod(wait_sec, 60)
     safe_log(f"{label}：ランダム待機 {m}分{s}秒")
     time.sleep(wait_sec)
+
 
 # -----------------------------
 # LINE通知
@@ -111,6 +119,7 @@ def send_line_message(text: str) -> bool:
         safe_log(f"LINE通知例外：{type(e).__name__}: {e}")
         return False
 
+
 # -----------------------------
 # Cloud Scheduler 自動ON/OFF
 # -----------------------------
@@ -125,6 +134,7 @@ AUTO_SCHEDULER_NAMES = [
     "night-report-30-scheduler-trigger",
     "night-checkout-scheduler-trigger",
 ]
+
 
 def get_access_token():
     """
@@ -142,8 +152,10 @@ def get_access_token():
         data = json.loads(resp.read().decode("utf-8"))
         return data["access_token"]
 
+
 def build_scheduler_resource(job_name: str) -> str:
     return f"projects/{GCP_PROJECT_ID}/locations/{GCP_REGION}/jobs/{job_name}"
+
 
 def call_scheduler_api(job_name: str, action: str) -> bool:
     """
@@ -182,6 +194,7 @@ def call_scheduler_api(job_name: str, action: str) -> bool:
         )
         return False
 
+
 def resume_auto_schedulers():
     safe_log("[scheduler] 自動実行用 Scheduler を RESUME 開始")
     results = {}
@@ -192,6 +205,7 @@ def resume_auto_schedulers():
     safe_log(f"[scheduler] RESUME 完了 success={ok_count} fail={ng_count}")
     return results
 
+
 def pause_auto_schedulers():
     safe_log("[scheduler] 自動実行用 Scheduler を PAUSE 開始")
     results = {}
@@ -201,6 +215,7 @@ def pause_auto_schedulers():
     ng_count = len(results) - ok_count
     safe_log(f"[scheduler] PAUSE 完了 success={ok_count} fail={ng_count}")
     return results
+
 
 def format_scheduler_result(results: dict) -> str:
     ok = [k for k, v in results.items() if v]
@@ -217,6 +232,7 @@ def format_scheduler_result(results: dict) -> str:
         lines.extend([f"- {x}" for x in ng])
 
     return "\n".join(lines)
+
 
 # -----------------------------
 # 共通ブラウザ起動関数
@@ -243,6 +259,7 @@ def start_browser(log_tag):
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
+
 # -----------------------------
 # デバッグ
 # -----------------------------
@@ -266,6 +283,7 @@ def dump_debug_info(driver, prefix=""):
     except Exception as e:
         safe_log(f"{prefix}page_source取得失敗: {type(e).__name__}: {e}")
 
+
 # -----------------------------
 # 共通待機＆クリック
 # -----------------------------
@@ -275,6 +293,7 @@ def wait_and_click(driver, xpath, label, timeout=60):
     )
     elem.click()
     safe_log(f"{label} をクリック")
+
 
 def wait_until_any(driver, xpaths, label, timeout=60):
     end = time.time() + timeout
@@ -295,6 +314,7 @@ def wait_until_any(driver, xpaths, label, timeout=60):
 
     raise TimeoutException(f"{label} が見つかりません last_error={last_error}")
 
+
 # -----------------------------
 # お知らせが出ていたら閉じる
 # -----------------------------
@@ -312,6 +332,7 @@ def close_notice_if_present(driver, timeout=3):
     except Exception:
         safe_log("会社からのお知らせなし")
         return False
+
 
 # -----------------------------
 # テナント選択
@@ -349,6 +370,46 @@ def select_tenant(driver, timeout=60):
         dump_debug_info(driver, prefix="テナント選択失敗時 ")
         raise
 
+
+# -----------------------------
+# 異常ページ検知
+# -----------------------------
+def is_warning_page(driver) -> bool:
+    page = get_page_text(driver)
+    title = ""
+    url = get_current_url(driver)
+
+    try:
+        title = driver.title or ""
+    except Exception:
+        pass
+
+    keywords = [
+        "<b>Warning</b>",
+        "Warning",
+        "Fatal error",
+        "Notice",
+        "Parse error",
+    ]
+
+    for kw in keywords:
+        if kw in page:
+            return True
+        if kw in title:
+            return True
+
+    if "Warning" in url or "Fatal" in url:
+        return True
+
+    return False
+
+
+def raise_if_warning_page(driver, label=""):
+    if is_warning_page(driver):
+        dump_debug_info(driver, prefix=f"{label}Warningページ検知時 ")
+        raise RuntimeError(f"{label}Warningページ検知")
+
+
 # -----------------------------
 # ログイン＋テナント選択＋決定
 # -----------------------------
@@ -358,6 +419,7 @@ def login_and_select_tenant(driver, timeout=60):
 
     driver.get(LOGIN_URL)
     safe_log("ログインページにアクセス")
+    raise_if_warning_page(driver, "ログインページ ")
 
     WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.NAME, "staff_id"))
@@ -373,12 +435,18 @@ def login_and_select_tenant(driver, timeout=60):
     password.send_keys(PASSWORD)
 
     wait_and_click(driver, "//input[@name='send']", "ログイン送信ボタン", timeout=timeout)
+    time.sleep(1)
+    raise_if_warning_page(driver, "ログイン送信後 ")
 
     close_notice_if_present(driver, timeout=3)
+    raise_if_warning_page(driver, "お知らせ処理後 ")
 
     select_tenant(driver, timeout=timeout)
+    raise_if_warning_page(driver, "テナント選択後 ")
 
     wait_and_click(driver, "//input[@value='決定']", "決定ボタン", timeout=timeout)
+    time.sleep(1)
+    raise_if_warning_page(driver, "決定後 ")
 
     try:
         wait_until_any(
@@ -396,6 +464,7 @@ def login_and_select_tenant(driver, timeout=60):
         dump_debug_info(driver, prefix="決定後失敗時 ")
         raise
 
+
 # -----------------------------
 # 成功/終了済み画面判定
 # -----------------------------
@@ -405,11 +474,13 @@ def get_page_text(driver):
     except Exception:
         return ""
 
+
 def get_current_url(driver):
     try:
         return driver.current_url
     except Exception:
         return ""
+
 
 def is_report_completed(driver, timeout=60):
     try:
@@ -425,6 +496,7 @@ def is_report_completed(driver, timeout=60):
         return True
     except Exception:
         return False
+
 
 def is_effectively_completed(driver, mode):
     url = get_current_url(driver)
@@ -448,6 +520,17 @@ def is_effectively_completed(driver, mode):
         return True
 
     return False
+
+
+# -----------------------------
+# 再試行待機秒
+# -----------------------------
+def get_retry_wait_seconds(attempt: int) -> int:
+    idx = max(0, attempt - 1)
+    if idx >= len(RETRY_WAIT_SECONDS):
+        return RETRY_WAIT_SECONDS[-1]
+    return RETRY_WAIT_SECONDS[idx]
+
 
 # -----------------------------
 # 単発処理
@@ -479,7 +562,11 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
             driver = start_browser(log_tag)
             login_and_select_tenant(driver, timeout=timeout)
 
+            raise_if_warning_page(driver, f"{disp}開始前 ")
+
             wait_and_click(driver, xpath_button, f"{disp}ボタン", timeout=timeout)
+            time.sleep(1)
+            raise_if_warning_page(driver, f"{disp}ボタン押下後 ")
 
             wait_until_any(
                 driver,
@@ -488,6 +575,8 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
                 timeout=timeout,
             )
             wait_and_click(driver, "//input[@value='内容確認']", "内容確認ボタン", timeout=timeout)
+            time.sleep(1)
+            raise_if_warning_page(driver, "内容確認後 ")
 
             wait_until_any(
                 driver,
@@ -496,6 +585,8 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
                 timeout=timeout,
             )
             wait_and_click(driver, "//input[@value='報告']", f"{disp}報告ボタン", timeout=timeout)
+            time.sleep(1)
+            raise_if_warning_page(driver, "報告送信後 ")
 
             if is_report_completed(driver, timeout=timeout):
                 safe_log(f"{disp}完了（終了するリンク確認）")
@@ -580,8 +671,9 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
                     send_line_message(f"【夜勤】{disp} 失敗")
                 return False
 
-            safe_log("5秒後に再試行...")
-            time.sleep(5)
+            wait_sec = get_retry_wait_seconds(attempt)
+            safe_log(f"{wait_sec}秒後に再試行...")
+            time.sleep(wait_sec)
 
         finally:
             if driver:
@@ -592,17 +684,21 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
 
     return False
 
+
 # -----------------------------
 # ラッパー関数
 # -----------------------------
 def run_checkin():
     return perform_action("出勤")
 
+
 def run_report(hour):
     return perform_action("勤務状況報告", report_hour=hour)
 
+
 def run_checkout():
     return perform_action("退勤")
+
 
 # -----------------------------
 # CLI
@@ -612,6 +708,7 @@ def print_usage():
     print("  python main.py checkin")
     print("  python main.py report 28")
     print("  python main.py checkout")
+
 
 def main():
     if len(sys.argv) < 2:
@@ -655,6 +752,7 @@ def main():
     else:
         print_usage()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
