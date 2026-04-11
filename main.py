@@ -8,8 +8,9 @@
 #  - Cloud Run では option直クリックではなく Select でテナント選択
 #  - checkin成功後 : report系 + checkout の Cloud Scheduler を resume
 #  - checkout成功後: report系 + checkout の Cloud Scheduler を pause
-#  - 再試行間隔を 15秒 → 30秒 → 60秒 に強化
 #  - Warning / Fatal error / Notice ページ検知を追加
+#  - 再試行間隔を 15秒 → 30秒 → 60秒 → 90秒 → 120秒 に強化
+#  - report系は retry=5
 # =============================
 
 import os
@@ -54,7 +55,7 @@ ENABLE_RANDOM_DELAY = os.getenv("ENABLE_RANDOM_DELAY", "1").strip() == "1"
 RANDOM_DELAY_MAX_MINUTES = int(os.getenv("RANDOM_DELAY_MAX_MINUTES", "6").strip())
 
 # 再試行待機秒
-RETRY_WAIT_SECONDS = [15, 30, 60]
+RETRY_WAIT_SECONDS = [15, 30, 60, 90, 120]
 
 # -----------------------------
 # 基本設定
@@ -372,6 +373,23 @@ def select_tenant(driver, timeout=60):
 
 
 # -----------------------------
+# 成功/終了済み画面判定用
+# -----------------------------
+def get_page_text(driver):
+    try:
+        return driver.page_source
+    except Exception:
+        return ""
+
+
+def get_current_url(driver):
+    try:
+        return driver.current_url
+    except Exception:
+        return ""
+
+
+# -----------------------------
 # 異常ページ検知
 # -----------------------------
 def is_warning_page(driver) -> bool:
@@ -386,7 +404,6 @@ def is_warning_page(driver) -> bool:
 
     keywords = [
         "<b>Warning</b>",
-        "Warning",
         "Fatal error",
         "Notice",
         "Parse error",
@@ -397,9 +414,6 @@ def is_warning_page(driver) -> bool:
             return True
         if kw in title:
             return True
-
-    if "Warning" in url or "Fatal" in url:
-        return True
 
     return False
 
@@ -463,23 +477,6 @@ def login_and_select_tenant(driver, timeout=60):
         safe_log(f"決定後の主要ボタン待ちで失敗: {type(e).__name__}: {e}")
         dump_debug_info(driver, prefix="決定後失敗時 ")
         raise
-
-
-# -----------------------------
-# 成功/終了済み画面判定
-# -----------------------------
-def get_page_text(driver):
-    try:
-        return driver.page_source
-    except Exception:
-        return ""
-
-
-def get_current_url(driver):
-    try:
-        return driver.current_url
-    except Exception:
-        return ""
 
 
 def is_report_completed(driver, timeout=60):
@@ -689,15 +686,15 @@ def perform_action(mode, report_hour=None, retry=3, timeout=60):
 # ラッパー関数
 # -----------------------------
 def run_checkin():
-    return perform_action("出勤")
+    return perform_action("出勤", retry=3)
 
 
 def run_report(hour):
-    return perform_action("勤務状況報告", report_hour=hour)
+    return perform_action("勤務状況報告", report_hour=hour, retry=5)
 
 
 def run_checkout():
-    return perform_action("退勤")
+    return perform_action("退勤", retry=3)
 
 
 # -----------------------------
